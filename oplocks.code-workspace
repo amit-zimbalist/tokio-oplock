@@ -1,0 +1,21 @@
+{
+  "folders": [
+    {
+      "name": "Oplocks",
+      "path": "."
+    }
+  ],
+  "settings": {
+    // Explicitly point rust-analyzer to your workspace configuration
+    "rust-analyzer.linkedProjects": [
+      "./Cargo.toml"
+    ],
+    // Automatically run clippy linting on file save
+    "rust-analyzer.check.command": "clippy",
+    // Format files automatically whenever you hit save
+    "editor.formatOnSave": true,
+    "[rust]": {
+      "editor.defaultFormatter": "rust-lang.rust-analyzer"
+    }
+  }
+}
