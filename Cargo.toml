@@ -2,6 +2,12 @@
 name = "oplocks"
 version = "0.1.0"
 edition = "2024"
+description = "Safe async Windows oplock abstractions for Rust"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/amit-zimbalist/tokio-oplock"
+keywords = ["windows", "oplock", "iocp", "async", "filesystem"]
+categories = ["os::windows-apis", "asynchronous"]
 
 [dependencies]
 tokio = { version = "1", features = [
