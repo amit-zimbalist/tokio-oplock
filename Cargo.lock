@@ -30,14 +30,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "oplocks"
-version = "0.1.0"
-dependencies = [
- "tokio",
- "windows-sys",
-]
-
-[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -105,6 +97,14 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tokio-oplock"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "windows-sys",
 ]
 
 [[package]]
