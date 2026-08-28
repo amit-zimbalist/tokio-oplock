@@ -19,7 +19,7 @@ mod windows_app {
     };
 
     use tokio::{sync::oneshot, task::JoinSet, time::timeout};
-    use tokio_oplock::oplock::{Oplock, OplockOutcome, OplockRuntime};
+    use tokio_oplock::{OplockLevel, OplockOptions, OplockOutcome, OplockRuntime, OplockTarget};
     use windows_sys::Win32::{
         Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE},
         Storage::FileSystem::{
@@ -31,6 +31,10 @@ mod windows_app {
 
     const OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
     const CANCEL_BATCH: usize = 64;
+
+    fn read_handle() -> OplockOptions {
+        OplockOptions::new(OplockTarget::File, OplockLevel::ReadHandle)
+    }
 
     #[derive(Clone)]
     struct OpenSpec {
@@ -97,11 +101,11 @@ mod windows_app {
         match args.next() {
             Some(mode) if mode == "--child-open" => child_open(args.collect()),
             Some(mode) if mode == "--child-hold" => child_hold(args.collect()),
-            Some(mode) if mode == "--runtime-drop-child" => {
-                runtime_drop_child(args.collect()).await
+            Some(mode) if mode == "--runtime-shutdown-child" => {
+                runtime_shutdown_child(args.collect()).await
             }
-            Some(mode) if mode == "--probe-runtime-drop" => {
-                probe_runtime_drop(args.collect()).await
+            Some(mode) if mode == "--probe-runtime-shutdown" => {
+                probe_runtime_shutdown(args.collect()).await
             }
             Some(mode) if mode == "--probe-preexisting" => probe_preexisting(args.collect()).await,
             first => run_parent(first, args.collect()).await,
@@ -125,7 +129,7 @@ mod windows_app {
 
         let specs = open_specs();
         let executable = env::current_exe()?;
-        let _runtime = OplockRuntime::new()?;
+        let runtime = OplockRuntime::new()?;
         let started = Instant::now();
         let deadline = started + requested;
         let mut last_progress = started;
@@ -143,6 +147,7 @@ mod windows_app {
         while Instant::now() < deadline {
             let spec_index = sequence % specs.len();
             run_external_open(
+                &runtime,
                 &executable,
                 &contention_path,
                 &specs[spec_index],
@@ -158,14 +163,14 @@ mod windows_app {
             stats.covered_specs.insert(spec_index);
             sequence += 1;
 
-            if sequence.is_multiple_of(16) {
-                run_self_open(&self_path, &mut stats).await?;
+            if sequence % 16 == 0 {
+                run_self_open(&runtime, &self_path, &mut stats).await?;
             }
-            if sequence.is_multiple_of(32) {
-                run_completed_cancellation_batch(&cancel_paths, &mut stats).await?;
+            if sequence % 32 == 0 {
+                run_completed_cancellation_batch(&runtime, &cancel_paths, &mut stats).await?;
             }
-            if sequence.is_multiple_of(64) {
-                run_aborted_cancellation_batch(&cancel_paths, &mut stats).await?;
+            if sequence % 64 == 0 {
+                run_aborted_cancellation_batch(&runtime, &cancel_paths, &mut stats).await?;
             }
 
             if last_progress.elapsed() >= Duration::from_secs(15) {
@@ -200,6 +205,7 @@ mod windows_app {
             specs.len(),
             stats.max_external_open_us,
         );
+        runtime.shutdown().await?;
         Ok(())
     }
 
@@ -275,6 +281,7 @@ mod windows_app {
     }
 
     async fn run_external_open(
+        runtime: &OplockRuntime,
         executable: &Path,
         path: &Path,
         spec: &OpenSpec,
@@ -283,12 +290,14 @@ mod windows_app {
         std::fs::write(path, b"field stress baseline")?;
         let (ready_tx, ready_rx) = oneshot::channel();
         let oplock_path = path.to_path_buf();
+        let runtime = runtime.clone();
         let mut oplock = tokio::spawn(async move {
-            Oplock::run(oplock_path, |_file| async move {
-                let _ = ready_tx.send(());
-                pending::<io::Result<()>>().await
-            })
-            .await
+            runtime
+                .run(oplock_path, read_handle(), async |_file| {
+                    let _ = ready_tx.send(());
+                    pending::<io::Result<()>>().await
+                })
+                .await
         });
 
         timeout(OPERATION_TIMEOUT, ready_rx)
@@ -317,7 +326,7 @@ mod windows_app {
                     OplockOutcome::Broken { guard, .. } => {
                         stats.oplock_breaks += 1;
                         tokio::time::sleep(Duration::from_millis(2)).await;
-                        drop(guard);
+                        guard.close().await?;
                     }
                     OplockOutcome::Completed(()) => {
                         return Err(io::Error::other("pending work completed unexpectedly"));
@@ -350,12 +359,18 @@ mod windows_app {
     }
 
     async fn run_completed_cancellation_batch(
+        runtime: &OplockRuntime,
         paths: &[PathBuf],
         stats: &mut Stats,
     ) -> io::Result<()> {
         let mut tasks = JoinSet::new();
         for path in paths.iter().cloned() {
-            tasks.spawn(async move { Oplock::run(path, |_file| async { Ok(()) }).await });
+            let runtime = runtime.clone();
+            tasks.spawn(async move {
+                runtime
+                    .run(path, read_handle(), async |_file| Ok::<(), io::Error>(()))
+                    .await
+            });
         }
 
         timeout(OPERATION_TIMEOUT, async {
@@ -363,7 +378,7 @@ mod windows_app {
                 match result.map_err(io::Error::other)?? {
                     OplockOutcome::Completed(()) => stats.completed_cancellations += 1,
                     OplockOutcome::Broken { guard, .. } => {
-                        drop(guard);
+                        guard.close().await?;
                         return Err(io::Error::other(
                             "cancellation-only oplock unexpectedly broke",
                         ));
@@ -377,20 +392,23 @@ mod windows_app {
     }
 
     async fn run_aborted_cancellation_batch(
+        runtime: &OplockRuntime,
         paths: &[PathBuf],
         stats: &mut Stats,
     ) -> io::Result<()> {
         let mut tasks = Vec::with_capacity(paths.len());
         let mut ready = Vec::with_capacity(paths.len());
         for path in paths.iter().cloned() {
+            let runtime = runtime.clone();
             let (ready_tx, ready_rx) = oneshot::channel();
             ready.push(ready_rx);
             tasks.push(tokio::spawn(async move {
-                Oplock::run(path, |_file| async move {
-                    let _ = ready_tx.send(());
-                    pending::<io::Result<()>>().await
-                })
-                .await
+                runtime
+                    .run(path, read_handle(), async |_file| {
+                        let _ = ready_tx.send(());
+                        pending::<io::Result<()>>().await
+                    })
+                    .await
             }));
         }
 
@@ -413,26 +431,30 @@ mod windows_app {
         Ok(())
     }
 
-    async fn run_self_open(path: &Path, stats: &mut Stats) -> io::Result<()> {
+    async fn run_self_open(
+        runtime: &OplockRuntime,
+        path: &Path,
+        stats: &mut Stats,
+    ) -> io::Result<()> {
         std::fs::write(path, b"self-open baseline")?;
         let work_path = path.to_path_buf();
         let outcome = timeout(
             OPERATION_TIMEOUT,
-            Oplock::run(path, |_file| async move {
+            runtime.run(path, read_handle(), async |_file| {
                 let file = tokio::fs::OpenOptions::new()
                     .write(true)
                     .truncate(true)
                     .open(work_path)
                     .await?;
                 drop(file);
-                Ok(())
+                Ok::<(), io::Error>(())
             }),
         )
         .await
         .map_err(|_| io::Error::other("opening the oplocked file from its own work timed out"))??;
 
         if let OplockOutcome::Broken { guard, .. } = outcome {
-            drop(guard);
+            guard.close().await?;
         }
         stats.self_opens += 1;
         Ok(())
@@ -577,44 +599,44 @@ mod windows_app {
         Ok(())
     }
 
-    async fn runtime_drop_child(args: Vec<OsString>) -> io::Result<()> {
+    async fn runtime_shutdown_child(args: Vec<OsString>) -> io::Result<()> {
         let path = args
             .first()
             .map(PathBuf::from)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing probe path"))?;
-        std::fs::write(&path, b"runtime drop probe")?;
+        std::fs::write(&path, b"runtime shutdown probe")?;
         let runtime = OplockRuntime::new()?;
         let (ready_tx, ready_rx) = oneshot::channel();
+        let runner = runtime.clone();
         let task = tokio::spawn(async move {
-            Oplock::run(path, |_file| async move {
-                let _ = ready_tx.send(());
-                pending::<io::Result<()>>().await
-            })
-            .await
+            runner
+                .run(path, read_handle(), async |_file| {
+                    let _ = ready_tx.send(());
+                    pending::<io::Result<()>>().await
+                })
+                .await
         });
         ready_rx
             .await
-            .map_err(|_| io::Error::other("runtime drop probe was not ready"))?;
+            .map_err(|_| io::Error::other("runtime shutdown probe was not ready"))?;
 
-        // This is deliberately performed while an oplock is pending. A blocking
-        // Drop implementation deadlocks here because this task cannot abort the
-        // oplock until Drop returns.
-        drop(runtime);
-        task.abort();
+        // Explicit shutdown must cancel and drain the pending request without
+        // relying on the task to release its runtime clone first.
+        runtime.shutdown().await?;
         let _ = task.await;
         Ok(())
     }
 
-    async fn probe_runtime_drop(args: Vec<OsString>) -> io::Result<()> {
+    async fn probe_runtime_shutdown(args: Vec<OsString>) -> io::Result<()> {
         let timeout_secs = args
             .first()
             .map(|value| parse_number::<u64>(value, "probe timeout"))
             .transpose()?
             .unwrap_or(3);
         let directory = TestDirectory::new()?;
-        let path = directory.path("runtime-drop.bin");
+        let path = directory.path("runtime-shutdown.bin");
         let mut child = Command::new(env::current_exe()?)
-            .arg("--runtime-drop-child")
+            .arg("--runtime-shutdown-child")
             .arg(path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -625,11 +647,11 @@ mod windows_app {
         while Instant::now() < deadline {
             if let Some(status) = child.try_wait()? {
                 if status.success() {
-                    println!("PASS runtime_drop_pending_oplock");
+                    println!("PASS runtime_shutdown_pending_oplock");
                     return Ok(());
                 }
                 return Err(io::Error::other(format!(
-                    "runtime drop child failed with {status}"
+                    "runtime shutdown child failed with {status}"
                 )));
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -640,7 +662,7 @@ mod windows_app {
         Err(io::Error::new(
             io::ErrorKind::TimedOut,
             format!(
-                "runtime Drop deadlocked for at least {timeout_secs}s while an oplock was pending"
+                "runtime shutdown deadlocked for at least {timeout_secs}s while an oplock was pending"
             ),
         ))
     }
@@ -655,7 +677,7 @@ mod windows_app {
         let directory = TestDirectory::new()?;
         let path = directory.path("preexisting.bin");
         let executable = env::current_exe()?;
-        let _runtime = OplockRuntime::new()?;
+        let runtime = OplockRuntime::new()?;
         let mut library_successes = 0u32;
         let mut library_open_errors = 0u32;
 
@@ -692,14 +714,14 @@ mod windows_app {
 
             match timeout(
                 Duration::from_secs(2),
-                Oplock::run(&path, |_file| async { Ok(()) }),
+                runtime.run(&path, read_handle(), async |_file| Ok::<(), io::Error>(())),
             )
             .await
             .map_err(|_| io::Error::other("library open blocked behind preexisting application"))?
             {
                 Ok(OplockOutcome::Completed(())) => library_successes += 1,
                 Ok(OplockOutcome::Broken { guard, .. }) => {
-                    drop(guard);
+                    guard.close().await?;
                     library_successes += 1;
                 }
                 Err(_) => library_open_errors += 1,
@@ -711,6 +733,7 @@ mod windows_app {
             ensure_child_success(&output)?;
         }
 
+        runtime.shutdown().await?;
         println!(
             "PASS preexisting_application share_masks=8 child_failures=0 library_successes={} library_open_errors={}",
             library_successes, library_open_errors

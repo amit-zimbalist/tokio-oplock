@@ -1,16 +1,39 @@
 # tokio-oplock
 
-Safe asynchronous Windows oplock coordination for Tokio applications.
+Safe, runtime-scoped asynchronous Windows oplocks for Tokio applications.
 
-`tokio-oplock` lets a task perform work against a file while Windows watches for a conflicting open. If another application needs incompatible access, the work future is cancelled and the caller receives the oplock-break information plus the file guard that must be released promptly.
+`tokio-oplock` lets an async task operate on a file while Windows watches for
+conflicting access. The crate races the task against the oplock notification,
+cancels in-flight work safely, and retains ownership of the protected handle
+until the caller explicitly releases a break guard.
 
-## Status
+## Status and platform scope
 
-This is a Windows-only `0.1` crate. Its local-file behavior has been stress-tested for ten continuous minutes under Windows Application Verifier Full Page Heap, including external processes, every Windows share-mask combination, cancellation races, self-opens, and runtime shutdown. See [Safety and limitations](#safety-and-limitations) before deploying it.
+Version `0.2` is a breaking, production-oriented redesign. It uses only the
+modern `FSCTL_REQUEST_OPLOCK` protocol introduced in Windows 7 and supports all
+four modern caching combinations:
+
+| Rust level | Windows level | Files | Directories |
+| --- | --- | --- | --- |
+| `Read` | R | yes | yes |
+| `ReadHandle` | RH | yes | yes |
+| `ReadWrite` | RW | yes | no |
+| `ReadWriteHandle` | RWH | yes | no |
+
+“Windows 7 oplocks” describes the protocol, not the minimum operating-system
+version. The crate deliberately does not use the legacy Windows Vista/XP
+`FSCTL_REQUEST_OPLOCK_LEVEL_*` control codes. Current Rust Windows targets
+require Windows 10 or Windows Server 2016 or newer.
+
+The implementation has stress coverage for local Windows files, IOCP
+completion and cancellation races, simultaneous runtimes, explicit shutdown,
+external conflicting opens, every sharing mask, directories, and positional
+data I/O. Remote shares and unusual filesystem drivers still require
+environment-specific qualification before deployment.
 
 ## Installation
 
-Until you choose to publish a release, depend on the repository directly:
+Until `0.2` is published, depend on the repository directly:
 
 ```toml
 [target.'cfg(windows)'.dependencies]
@@ -18,103 +41,192 @@ tokio-oplock = { git = "https://github.com/amit-zimbalist/tokio-oplock.git" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-The Cargo package name is `tokio-oplock`; Rust code imports it as `tokio_oplock`.
+The Cargo package is `tokio-oplock`; Rust code imports it as `tokio_oplock`.
 
 ## Quick start
 
 ```rust
-use std::{io, path::PathBuf};
-
 use tokio_oplock::{
-    OplockRuntime,
-    oplock::{Oplock, OplockOutcome},
+    OplockError, OplockLevel, OplockOptions, OplockOutcome,
+    OplockRuntime, OplockTarget,
 };
 
 #[tokio::main]
-async fn main() -> io::Result<()> {
-    let path = PathBuf::from(r"C:\data\sample.bin");
-    let _runtime = OplockRuntime::new()?;
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = OplockRuntime::new()?;
+    let options = OplockOptions::new(
+        OplockTarget::File,
+        OplockLevel::ReadHandle,
+    );
 
-    let outcome = Oplock::run(&path, |file| async move {
-        let metadata = file.metadata().await?;
-        Ok(metadata.len())
-    })
-    .await?;
+    let outcome = runtime
+        .run(r"C:\data\sample.bin", options, async |file| {
+            let metadata = file.metadata().await?;
+            Ok::<_, OplockError>(metadata.len())
+        })
+        .await?;
 
     match outcome {
         OplockOutcome::Completed(length) => {
-            println!("Stable scan completed; file length is {length} bytes");
+            println!("Stable scan completed: {length} bytes");
         }
         OplockOutcome::Broken { info, guard } => {
             eprintln!(
-                "Scan cancelled by oplock break: {:#x} -> {:#x}",
-                info.original_level, info.new_level
+                "Oplock broke from {:?} to {:?}; flags={:?}",
+                info.original_level,
+                info.new_level,
+                info.flags,
             );
-            drop(guard); // Release the file handle so the other application can continue.
+            guard.close().await?;
         }
     }
 
+    runtime.shutdown().await?;
     Ok(())
 }
 ```
 
-Keep `OplockRuntime` alive while requests are being created. Only one runtime accepts requests at a time; after shutdown begins, a replacement runtime can start while already-submitted completions drain safely.
+Async closures (`async |file| { ... }`) can borrow `OplockFile` across awaits
+without making the handle cloneable or exposing it to detached tasks.
 
-## Break semantics
+## The 0.2 design
 
-`Oplock::run` requests a read/handle-caching oplock and races two futures:
+1. **Modern, explicit oplock requests.** `OplockLevel` represents R, RH, RW,
+   and RWH directly. `OplockTarget` makes file-versus-directory behavior
+   explicit, and invalid directory write-caching requests fail before opening a
+   handle. `ShareMode` controls path-open sharing.
 
-- The supplied work future. If it wins, the result is `OplockOutcome::Completed(T)` and the pending oplock request is cancelled.
-- The Windows oplock completion. If it wins, the work future is dropped and the result is `OplockOutcome::Broken { info, guard }`.
+2. **Runtime ownership instead of global state.** Every `OplockRuntime::new()`
+   creates an independent completion port and dispatcher thread. Runtimes can
+   coexist. `shutdown().await` stops new work, cancels and closes every session,
+   drains queued completions, joins the dispatcher, and reports collected
+   `RuntimeIssue` values through `ShutdownError`.
 
-The work future must therefore be cancellation-safe: do not rely on code after an `.await` always running, and avoid detached or non-cancellable work that continues using the file after the future is dropped.
+3. **A capability-safe protected handle.** Work receives a borrowed,
+   non-cloneable `OplockFile`. It exposes metadata, flush, and positional
+   `read_at`/`write_at` operations but no raw Windows handle. Data operations
+   own their `Vec<u8>` and return it on completion, so caller memory cannot be
+   invalidated by async cancellation. Writes require an RW or RWH request.
 
-On a break, release `guard` as soon as your cleanup is complete. Holding it can intentionally delay the conflicting application. The `ack_required` field reports whether Windows requested acknowledgement; this crate releases the request by closing the guarded handle.
+4. **Defined break and cancellation behavior.** Work is raced against the
+   oplock request. If work finishes first, the request is specifically
+   cancelled and its IOCP completion is drained before the handle closes. If a
+   break wins—or both futures become ready together—the work future is dropped and a close-only
+   `OplockBreakGuard` is returned. Calling `guard.close().await` releases any
+   required acknowledgement by closing the handle. Dropping a guard or runtime
+   starts best-effort cleanup, but explicit close and shutdown are preferred
+   when errors matter.
+
+5. **Operational diagnostics and release hygiene.** Open, association,
+   request, operation, cancellation, close, and dispatcher failures have
+   structured `OplockError` variants. The package declares its Rust version,
+   Windows documentation target, repository metadata, and MIT license. Tests
+   cover real Windows behavior rather than only type-level mocks.
+
+## Opening targets
+
+`OplockRuntime::run` is the preferred entry point. It opens the path with
+`FILE_FLAG_OVERLAPPED | FILE_FLAG_OPEN_REQUIRING_OPLOCK`, so a conflicting open
+cannot slip between the crate's open and oplock request.
+
+`OplockRuntime::run_file` takes ownership of a `std::fs::File` for integration
+with code that already opens handles. That handle must have been opened for
+overlapped I/O. This entry point cannot retroactively eliminate the race between
+the caller's open and the oplock request.
+
+Directories require `OplockTarget::Directory`; the crate adds
+`FILE_FLAG_BACKUP_SEMANTICS` and accepts only R or RH levels.
+
+## Protected I/O
+
+Reads and writes are positional and return both their result and the original
+owned buffer:
+
+```rust
+let (result, buffer) = file.read_at(vec![0; 4096], 0).await;
+let bytes_read = result?;
+process(&buffer[..bytes_read]);
+```
+
+For writes, select `ReadWrite` or `ReadWriteHandle`:
+
+```rust
+let (result, buffer) = file.write_at(payload, offset).await;
+result?;
+file.sync_data().await?;
+drop(buffer);
+```
+
+The work future must still be cancellation-safe: do not rely on statements
+after an `.await` always executing. The API prevents the protected handle and
+borrowed buffers from escaping, but it cannot make unrelated external side
+effects transactional.
+
+## Break information
+
+`OplockBreak` reports:
+
+- raw and recognized original and replacement `OplockLevel` values;
+- retained `OplockBreakFlags`, including acknowledgement and mode flags;
+- `ack_required` for convenient policy checks;
+- breaking access and share modes when Windows provides them.
+
+This crate intentionally uses a close-only break policy. It does not issue a
+downgrade acknowledgement and then resume work under a weaker caching level.
 
 ## Examples
 
 ```powershell
 cargo run --example basic -- C:\path\to\file
 cargo run --example metadata_scan -- C:\path\to\file
-cargo run --example concurrent_metadata -- C:\path\to\first C:\path\to\second
+cargo run --example concurrent_metadata -- C:\first C:\second
 cargo run --example retry_on_break -- C:\path\to\file
 ```
 
-- `basic` waits for a conflict and deliberately holds the returned guard for five seconds to demonstrate the external application's delay.
-- `metadata_scan` shows the smallest useful protected operation.
-- `concurrent_metadata` protects metadata work on several files through one process-wide runtime.
-- `retry_on_break` shows cancellation-safe metadata work and bounded retries after conflicts.
-- `field_stress` is the diagnostic harness used for the cross-process share/open matrix and shutdown probes.
+- `basic` waits for a conflicting open and demonstrates delayed guard release.
+- `metadata_scan` is the smallest useful protected operation.
+- `concurrent_metadata` uses one runtime for simultaneous independent files.
+- `retry_on_break` demonstrates cancellation-safe bounded retries.
+- `field_stress` drives cross-process open/share matrices and shutdown probes.
 
 ## Safety and limitations
 
-- Windows only. Validation was performed on local files; remote shares and uncommon filesystem drivers can implement or reject oplocks differently.
-- The crate's own handle requests read access and broad sharing. If an application already holds the file without `FILE_SHARE_READ`, Windows must reject the crate's open with a sharing violation; the existing application is not disturbed.
-- A conflicting application may be delayed until your work is cancelled and the returned guard is dropped. This timing effect is fundamental to oplocks.
-- The file passed to the work closure is an overlapped handle intended for the oplock request and handle/metadata operations. Tokio's regular-file `AsyncReadExt` currently performs synchronous reads internally and returns `ERROR_INVALID_PARAMETER` on this handle. Do not submit unrelated overlapped I/O on it either, because the handle is associated with the crate's private IOCP. General content scanning needs a dedicated safe read API that this `0.1` interface does not yet provide.
-- Dropping `OplockRuntime` stops that dispatcher from accepting requests but does not block on active requests. Their IOCP completions drain in the background.
-- The implementation retains every `OVERLAPPED` allocation through its sole IOCP completion, including immediate-success and cancellation paths.
-- Treat unexpected I/O errors as normal operational failures and retry only when that is appropriate for your application.
+- Windows only; the public oplock module is absent on other targets.
+- A conflicting application may remain blocked until work cancellation drains
+  and the break guard closes. That delay is fundamental to oplocks.
+- An existing handle that denies this crate's requested sharing can make the
+  atomic open fail with a sharing violation. The existing application is not
+  disturbed.
+- Oplock availability and semantics can vary on SMB shares and third-party
+  filesystems. Qualify the exact storage stack used in production.
+- `run_file` trusts the caller to provide an overlapped handle and cannot offer
+  the atomic-open guarantee of `run`.
+- Unexpected I/O errors are operational failures. Retry only when the
+  application can safely repeat the complete protected operation.
 
 ## Validation
 
-Run the normal suite:
+Run the normal release checks on Windows:
 
 ```powershell
 cargo test --locked --all-targets
 cargo clippy --locked --all-targets -- -D warnings
+cargo doc --locked --no-deps
 ```
 
-Run the field probes and continuous matrix:
+Run cross-process probes and the continuous scenario matrix:
 
 ```powershell
-cargo run --release --example field_stress -- --probe-runtime-drop 3
+cargo run --release --example field_stress -- --probe-runtime-shutdown 3
 cargo run --release --example field_stress -- --probe-preexisting
 cargo run --release --example field_stress -- --duration-secs 600
 ```
 
-For release qualification, enable Application Verifier Basics with Full Heaps for `field_stress.exe` before running the continuous test.
+For release qualification, run the release harness under Application Verifier
+Basics and Full Page Heap. Repeat it against every supported Windows release,
+filesystem, antivirus/minifilter configuration, and remote-share topology that
+the application will deploy.
 
 ## License
 
-MIT
+Licensed under the [MIT License](LICENSE).
