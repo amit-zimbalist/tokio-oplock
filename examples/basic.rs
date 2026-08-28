@@ -7,7 +7,7 @@ fn main() {
 use std::time::Duration;
 
 #[cfg(windows)]
-use oplocks::{
+use tokio_oplock::{
     OplockRuntime,
     oplock::{Oplock, OplockOutcome},
 };
