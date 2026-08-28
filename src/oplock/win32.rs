@@ -3,13 +3,16 @@ use std::{
     mem::{size_of, zeroed},
     os::windows::io::AsRawHandle,
     ptr::null_mut,
-    sync::{Arc, Condvar, Mutex, MutexGuard, Weak},
+    sync::{
+        Arc, Mutex, MutexGuard, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
 };
 
 use tokio::sync::oneshot;
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, ERROR_IO_PENDING, HANDLE, INVALID_HANDLE_VALUE},
+    Foundation::{CloseHandle, ERROR_IO_PENDING, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT},
     Storage::FileSystem::FILE_FLAG_OVERLAPPED,
     System::{
         IO::{
@@ -27,6 +30,7 @@ use windows_sys::Win32::{
 
 pub(super) const OVERLAPPED_FILE_FLAG: u32 = FILE_FLAG_OVERLAPPED;
 const SHUTDOWN_KEY: usize = usize::MAX;
+const COMPLETION_POLL_MS: u32 = 1_000;
 
 pub(super) struct RawOplockBreak {
     pub(super) original_level: u32,
@@ -44,16 +48,37 @@ impl Drop for OwnedHandle {
     }
 }
 
+struct CompletionPort {
+    handle: OwnedHandle,
+    shutdown_ready: AtomicBool,
+}
+
+impl CompletionPort {
+    fn request_shutdown(&self) {
+        self.shutdown_ready.store(true, Ordering::Release);
+        // SAFETY: the port is live and the reserved key identifies our sentinel.
+        // A polling fallback in completion_loop observes shutdown_ready even if
+        // this unexpected wake-up failure occurs.
+        unsafe {
+            PostQueuedCompletionStatus(self.handle.0, 0, SHUTDOWN_KEY, null_mut());
+        }
+    }
+}
+
+// SAFETY: IOCP handles support concurrent association, posting, and queue reads.
+// The handle is closed only after all Arc owners, including the worker, exit.
+unsafe impl Send for CompletionPort {}
+unsafe impl Sync for CompletionPort {}
+
 struct RuntimeState {
     accepting: bool,
     active: usize,
 }
 
 struct Dispatcher {
-    port: OwnedHandle,
+    port: Arc<CompletionPort>,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
     state: Mutex<RuntimeState>,
-    idle: Condvar,
 }
 
 // SAFETY: IOCP handles support concurrent association and posting. Queue reads
@@ -70,7 +95,9 @@ static RUNTIME: Mutex<Option<Weak<Dispatcher>>> = Mutex::new(None);
 impl RawRuntime {
     pub(super) fn new() -> io::Result<Self> {
         let mut runtime = lock(&RUNTIME);
-        if runtime.as_ref().and_then(Weak::upgrade).is_some() {
+        if let Some(existing) = runtime.as_ref().and_then(Weak::upgrade)
+            && lock(&existing.state).accepting
+        {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "an oplock runtime is already running",
@@ -83,27 +110,22 @@ impl RawRuntime {
             return Err(io::Error::last_os_error());
         }
 
-        let port_bits = port as usize;
-        let worker = match thread::Builder::new()
+        let port = Arc::new(CompletionPort {
+            handle: OwnedHandle(port),
+            shutdown_ready: AtomicBool::new(false),
+        });
+        let worker_port = Arc::clone(&port);
+        let worker = thread::Builder::new()
             .name("oplock-iocp".into())
-            .spawn(move || completion_loop(port_bits as HANDLE))
-        {
-            Ok(worker) => worker,
-            Err(error) => {
-                // SAFETY: no thread was created, so this remains our handle.
-                unsafe { CloseHandle(port) };
-                return Err(error);
-            }
-        };
+            .spawn(move || completion_loop(worker_port))?;
 
         let dispatcher = Arc::new(Dispatcher {
-            port: OwnedHandle(port),
+            port,
             worker: Mutex::new(Some(worker)),
             state: Mutex::new(RuntimeState {
                 accepting: true,
                 active: 0,
             }),
-            idle: Condvar::new(),
         });
         *runtime = Some(Arc::downgrade(&dispatcher));
         Ok(Self { dispatcher })
@@ -118,23 +140,16 @@ impl Drop for RawRuntime {
 
 impl Dispatcher {
     fn shutdown(&self) {
-        let mut state = lock(&self.state);
-        state.accepting = false;
-        while state.active != 0 {
-            state = self
-                .idle
-                .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
-        drop(state);
-
-        // SAFETY: the port is live and the reserved key identifies our sentinel.
-        let posted =
-            unsafe { PostQueuedCompletionStatus(self.port.0, 0, SHUTDOWN_KEY, null_mut()) };
-        if posted == 0 {
+        let idle = {
+            let mut state = lock(&self.state);
+            state.accepting = false;
+            state.active == 0
+        };
+        if !idle {
             return;
         }
 
+        self.port.request_shutdown();
         let worker = lock(&self.worker).take();
         if let Some(worker) = worker {
             let _ = worker.join();
@@ -201,7 +216,7 @@ fn submit_request(
     let file = Arc::new(file);
     let raw_file = file.as_raw_handle() as HANDLE;
     // SAFETY: both handles are live and valid for IOCP association.
-    let associated = unsafe { CreateIoCompletionPort(raw_file, dispatcher.port.0, 0, 0) };
+    let associated = unsafe { CreateIoCompletionPort(raw_file, dispatcher.port.handle.0, 0, 0) };
     if associated.is_null() {
         return Err(io::Error::last_os_error());
     }
@@ -257,48 +272,64 @@ impl Drop for RawOplockGuard {
     }
 }
 
-fn submit(mut operation: Box<Operation>, file: HANDLE) -> io::Result<()> {
+fn submit(operation: Box<Operation>, file: HANDLE) -> io::Result<()> {
     let input = REQUEST_OPLOCK_INPUT_BUFFER {
         StructureVersion: REQUEST_OPLOCK_CURRENT_VERSION as u16,
         StructureLength: size_of::<REQUEST_OPLOCK_INPUT_BUFFER>() as u16,
         RequestedOplockLevel: OPLOCK_LEVEL_CACHE_READ | OPLOCK_LEVEL_CACHE_HANDLE,
         Flags: REQUEST_OPLOCK_INPUT_FLAG_REQUEST,
     };
-    // SAFETY: the file remains alive and boxed buffers remain stable through IOCP.
+    // Transfer ownership before submission because an immediate successful
+    // completion can be dequeued by the IOCP worker before DeviceIoControl
+    // returns to this thread.
+    let operation = Box::into_raw(operation);
+    // SAFETY: operation now has stable raw ownership reserved for the IOCP
+    // completion path, and the file remains alive through Operation::_file.
     let submitted = unsafe {
         DeviceIoControl(
             file,
             FSCTL_REQUEST_OPLOCK,
             &input as *const _ as *const _,
             size_of::<REQUEST_OPLOCK_INPUT_BUFFER>() as u32,
-            &mut operation.output as *mut _ as *mut _,
+            &mut (*operation).output as *mut _ as *mut _,
             size_of::<REQUEST_OPLOCK_OUTPUT_BUFFER>() as u32,
             null_mut(),
-            &mut operation.overlapped,
+            &mut (*operation).overlapped,
         )
     };
     if submitted == 0 {
         let error = io::Error::last_os_error();
         if error.raw_os_error() != Some(ERROR_IO_PENDING as i32) {
+            // SAFETY: synchronous non-pending failures do not queue an IOCP
+            // packet, so ownership never transferred to the completion loop.
+            unsafe { drop(Box::from_raw(operation)) };
             return Err(error);
         }
     }
-    let _ = Box::into_raw(operation);
     Ok(())
 }
 
-fn completion_loop(port: HANDLE) {
+fn completion_loop(port: Arc<CompletionPort>) {
     loop {
         let (mut bytes, mut key, mut overlapped) = (0, 0, null_mut());
         // SAFETY: port is owned by the runtime and outputs are writable locals.
         let ok = unsafe {
-            GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut overlapped, u32::MAX)
+            GetQueuedCompletionStatus(
+                port.handle.0,
+                &mut bytes,
+                &mut key,
+                &mut overlapped,
+                COMPLETION_POLL_MS,
+            )
         };
         if overlapped.is_null() {
-            if key == SHUTDOWN_KEY {
+            if key == SHUTDOWN_KEY || port.shutdown_ready.load(Ordering::Acquire) {
                 break;
             }
             if ok == 0 {
+                if io::Error::last_os_error().raw_os_error() == Some(WAIT_TIMEOUT as i32) {
+                    continue;
+                }
                 // The port was closed without an explicit shutdown packet.
                 break;
             }
@@ -327,13 +358,13 @@ fn completion_loop(port: HANDLE) {
 }
 
 fn operation_finished(dispatcher: &Dispatcher) {
-    let became_idle = {
+    let should_shutdown = {
         let mut state = lock(&dispatcher.state);
         state.active -= 1;
-        state.active == 0
+        state.active == 0 && !state.accepting
     };
-    if became_idle {
-        dispatcher.idle.notify_all();
+    if should_shutdown {
+        dispatcher.port.request_shutdown();
     }
 }
 

@@ -5,15 +5,15 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::LazyLock,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use oplocks::oplock::{Oplock, OplockOutcome, OplockRuntime};
 use tokio::{
     sync::{Mutex, MutexGuard, oneshot},
     task::JoinSet,
-    time::timeout,
+    time::{sleep, timeout},
 };
+use tokio_oplock::oplock::{Oplock, OplockOutcome, OplockRuntime};
 
 const CASE_TIMEOUT: Duration = Duration::from_secs(30);
 const CONCURRENT_OPLOCKS: usize = 64;
@@ -164,6 +164,72 @@ async fn runtime_repeatedly_starts_and_joins() -> io::Result<()> {
     })
     .await
     .map_err(|_| io::Error::other("runtime restart stress test timed out"))?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_drop_does_not_wait_for_pending_oplock() -> io::Result<()> {
+    let _serial = test_lock().await;
+    timeout(CASE_TIMEOUT, async {
+        let directory = TestDirectory::new("pending-runtime-drop")?;
+        let path = directory.files(1)?.remove(0);
+        let runtime = OplockRuntime::new()?;
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let oplock = tokio::spawn(async move {
+            Oplock::run(path, |_file| async move {
+                let _ = ready_tx.send(());
+                pending::<io::Result<()>>().await
+            })
+            .await
+        });
+
+        ready_rx
+            .await
+            .map_err(|_| io::Error::other("pending oplock did not become ready"))?;
+
+        let mut runtime_drop = tokio::task::spawn_blocking(move || {
+            let started = Instant::now();
+            drop(runtime);
+            started.elapsed()
+        });
+        let drop_duration = match timeout(Duration::from_secs(2), &mut runtime_drop).await {
+            Ok(result) => result.map_err(io::Error::other)?,
+            Err(_) => {
+                oplock.abort();
+                let _ = oplock.await;
+                let _ = timeout(Duration::from_secs(5), &mut runtime_drop).await;
+                return Err(io::Error::other(
+                    "runtime drop blocked while an oplock was pending",
+                ));
+            }
+        };
+        assert!(
+            drop_duration < Duration::from_secs(2),
+            "runtime drop took {drop_duration:?}"
+        );
+
+        oplock.abort();
+        let _ = oplock.await;
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                match OplockRuntime::new() {
+                    Ok(runtime) => {
+                        drop(runtime);
+                        break Ok::<(), io::Error>(());
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        sleep(Duration::from_millis(1)).await;
+                    }
+                    Err(error) => break Err(error),
+                }
+            }
+        })
+        .await
+        .map_err(|_| io::Error::other("dispatcher did not shut down after cancellation"))??;
+        Ok(())
+    })
+    .await
+    .map_err(|_| io::Error::other("pending runtime-drop regression test timed out"))?
 }
 
 async fn open_for_write(path: impl AsRef<Path>) -> io::Result<()> {
