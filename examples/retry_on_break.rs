@@ -4,14 +4,13 @@ fn main() {
 }
 
 #[cfg(windows)]
-use std::{env, io, path::PathBuf, sync::Arc, time::Duration};
+use std::{env, io, path::PathBuf, time::Duration};
 
 #[cfg(windows)]
 use tokio::time::sleep;
 #[cfg(windows)]
 use tokio_oplock::{
-    OplockRuntime,
-    oplock::{Oplock, OplockOutcome},
+    OplockError, OplockFile, OplockLevel, OplockOptions, OplockOutcome, OplockRuntime, OplockTarget,
 };
 
 #[cfg(windows)]
@@ -19,22 +18,24 @@ const MAX_ATTEMPTS: u32 = 5;
 
 #[cfg(windows)]
 #[tokio::main]
-async fn main() -> io::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = argument_path("usage: retry_on_break <path>")?;
-    let _runtime = OplockRuntime::new()?;
+    let runtime = OplockRuntime::new()?;
+    let options = OplockOptions::new(OplockTarget::File, OplockLevel::ReadHandle);
 
     for attempt in 1..=MAX_ATTEMPTS {
-        match Oplock::run(&path, scan).await? {
+        match runtime.run(&path, options, scan).await? {
             OplockOutcome::Completed(bytes) => {
                 println!("stable metadata scan completed on attempt {attempt}: {bytes} bytes");
+                runtime.shutdown().await?;
                 return Ok(());
             }
             OplockOutcome::Broken { info, guard } => {
                 eprintln!(
-                    "attempt {attempt} interrupted: {:#x} -> {:#x}",
+                    "attempt {attempt} interrupted: {:?} -> {:?}",
                     info.original_level, info.new_level
                 );
-                drop(guard);
+                guard.close().await?;
                 if attempt < MAX_ATTEMPTS {
                     sleep(Duration::from_millis(u64::from(attempt) * 50)).await;
                 }
@@ -42,14 +43,16 @@ async fn main() -> io::Result<()> {
         }
     }
 
+    runtime.shutdown().await?;
     Err(io::Error::new(
         io::ErrorKind::WouldBlock,
         format!("file changed during all {MAX_ATTEMPTS} scan attempts"),
-    ))
+    )
+    .into())
 }
 
 #[cfg(windows)]
-async fn scan(file: Arc<tokio::fs::File>) -> io::Result<u64> {
+async fn scan(file: &OplockFile) -> Result<u64, OplockError> {
     let original = file.metadata().await?;
     for _ in 0..20 {
         // Simulate asynchronous analysis while remaining cancellation-safe.
@@ -59,7 +62,8 @@ async fn scan(file: Arc<tokio::fs::File>) -> io::Result<u64> {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "file length changed during metadata scan",
-            ));
+            )
+            .into());
         }
     }
     Ok(original.len())

@@ -8,13 +8,12 @@ use std::time::Duration;
 
 #[cfg(windows)]
 use tokio_oplock::{
-    OplockRuntime,
-    oplock::{Oplock, OplockOutcome},
+    OplockError, OplockLevel, OplockOptions, OplockOutcome, OplockRuntime, OplockTarget,
 };
 
 #[cfg(windows)]
 #[tokio::main]
-async fn main() -> std::io::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::{env, io, path::PathBuf};
 
     let path = env::args_os()
@@ -22,21 +21,23 @@ async fn main() -> std::io::Result<()> {
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "usage: basic <path>"))?;
 
-    let _runtime = OplockRuntime::new()?;
-    let outcome = Oplock::run(&path, |_file| async {
-        println!(
-            "Oplock held on {}. Waiting for a conflicting open...",
-            path.display()
-        );
-        tokio::signal::ctrl_c().await?;
-        Ok(())
-    })
-    .await?;
+    let runtime = OplockRuntime::new()?;
+    let options = OplockOptions::new(OplockTarget::File, OplockLevel::ReadHandle);
+    let outcome = runtime
+        .run(&path, options, async |_file| {
+            println!(
+                "Oplock held on {}. Waiting for a conflicting open...",
+                path.display()
+            );
+            tokio::signal::ctrl_c().await?;
+            Ok::<(), OplockError>(())
+        })
+        .await?;
 
     match outcome {
         OplockOutcome::Broken { info, guard } => {
             println!(
-                "Oplock broken: original={:#x}, new={:#x}, flags={:#x}",
+                "Oplock broken: original={:?}, new={:?}, flags={:?}",
                 info.original_level, info.new_level, info.flags
             );
             if info.ack_required {
@@ -45,11 +46,12 @@ async fn main() -> std::io::Result<()> {
 
             println!("Holding the file handle for 5 more seconds before releasing the oplock...");
             tokio::time::sleep(Duration::from_secs(5)).await;
-            drop(guard);
+            guard.close().await?;
             println!("File handle released.");
         }
         OplockOutcome::Completed(()) => println!("Ctrl-C received; exiting."),
     }
 
+    runtime.shutdown().await?;
     Ok(())
 }

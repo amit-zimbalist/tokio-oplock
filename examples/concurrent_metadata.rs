@@ -9,14 +9,11 @@ use std::{env, io, path::PathBuf};
 #[cfg(windows)]
 use tokio::task::JoinSet;
 #[cfg(windows)]
-use tokio_oplock::{
-    OplockRuntime,
-    oplock::{Oplock, OplockOutcome},
-};
+use tokio_oplock::{OplockLevel, OplockOptions, OplockOutcome, OplockRuntime, OplockTarget};
 
 #[cfg(windows)]
 #[tokio::main(flavor = "multi_thread")]
-async fn main() -> io::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let paths = env::args_os()
         .skip(1)
         .map(PathBuf::from)
@@ -25,21 +22,25 @@ async fn main() -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "usage: concurrent_metadata <path> [path ...]",
-        ));
+        )
+        .into());
     }
 
-    let _runtime = OplockRuntime::new()?;
+    let runtime = OplockRuntime::new()?;
     let mut scans = JoinSet::new();
 
     for path in paths {
+        let runtime = runtime.clone();
         scans.spawn(async move {
             let display_path = path.clone();
-            let outcome = Oplock::run(path, |file| async move {
-                let metadata = file.metadata().await?;
-                Ok(metadata.len())
-            })
-            .await?;
-            Ok::<_, io::Error>((display_path, outcome))
+            let outcome = runtime
+                .run(
+                    path,
+                    OplockOptions::new(OplockTarget::File, OplockLevel::ReadHandle),
+                    async |file| Ok::<_, tokio_oplock::OplockError>(file.metadata().await?.len()),
+                )
+                .await?;
+            Ok::<_, tokio_oplock::OplockError>((display_path, outcome))
         });
     }
 
@@ -51,15 +52,16 @@ async fn main() -> io::Result<()> {
             }
             OplockOutcome::Broken { info, guard } => {
                 eprintln!(
-                    "{} interrupted: {:#x} -> {:#x}",
+                    "{} interrupted: {:?} -> {:?}",
                     path.display(),
                     info.original_level,
                     info.new_level
                 );
-                drop(guard);
+                guard.close().await?;
             }
         }
     }
 
+    runtime.shutdown().await?;
     Ok(())
 }

@@ -7,22 +7,24 @@ fn main() {
 use std::{env, io, path::PathBuf, time::SystemTime};
 
 #[cfg(windows)]
-use tokio_oplock::{
-    OplockRuntime,
-    oplock::{Oplock, OplockOutcome},
-};
+use tokio_oplock::{OplockLevel, OplockOptions, OplockOutcome, OplockRuntime, OplockTarget};
 
 #[cfg(windows)]
 #[tokio::main]
-async fn main() -> io::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = argument_path("usage: metadata_scan <path>")?;
-    let _runtime = OplockRuntime::new()?;
+    let runtime = OplockRuntime::new()?;
 
-    let outcome = Oplock::run(&path, |file| async move {
-        let metadata = file.metadata().await?;
-        Ok((metadata.len(), metadata.modified().ok()))
-    })
-    .await?;
+    let outcome = runtime
+        .run(
+            &path,
+            OplockOptions::new(OplockTarget::File, OplockLevel::ReadHandle),
+            async |file| {
+                let metadata = file.metadata().await?;
+                Ok::<_, tokio_oplock::OplockError>((metadata.len(), metadata.modified().ok()))
+            },
+        )
+        .await?;
 
     match outcome {
         OplockOutcome::Completed((length, modified)) => {
@@ -30,13 +32,14 @@ async fn main() -> io::Result<()> {
         }
         OplockOutcome::Broken { info, guard } => {
             eprintln!(
-                "metadata scan cancelled by oplock break: {:#x} -> {:#x}",
+                "metadata scan cancelled by oplock break: {:?} -> {:?}",
                 info.original_level, info.new_level
             );
-            drop(guard);
+            guard.close().await?;
         }
     }
 
+    runtime.shutdown().await?;
     Ok(())
 }
 
