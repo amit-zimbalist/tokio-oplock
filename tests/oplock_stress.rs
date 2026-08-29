@@ -303,6 +303,35 @@ async fn owned_std_file_entry_point_works() -> io::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn protected_handle_can_be_duplicated() -> io::Result<()> {
+    let _serial = test_lock().await;
+    let directory = TestDirectory::new("duplicate-handle")?;
+    let path = directory.files(1)?.remove(0);
+    let runtime = OplockRuntime::new()?;
+
+    let outcome = runtime
+        .run(&path, options(OplockLevel::ReadHandle), async |file| {
+            // SAFETY: the duplicate is only queried for synchronous metadata
+            // and closed; it is never used to submit overlapped I/O.
+            unsafe { file.try_clone_handle() }
+        })
+        .await?;
+
+    let duplicate = match outcome {
+        OplockOutcome::Completed(handle) => std::fs::File::from(handle),
+        OplockOutcome::Broken { guard, .. } => {
+            guard.close().await?;
+            return Err(io::Error::other("oplock unexpectedly broke"));
+        }
+    };
+    assert!(duplicate.metadata()?.len() > 0);
+
+    drop(duplicate);
+    runtime.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn independent_runtimes_can_coexist() -> io::Result<()> {
     let _serial = test_lock().await;
     let directory = TestDirectory::new("independent")?;

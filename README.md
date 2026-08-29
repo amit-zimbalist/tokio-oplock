@@ -87,7 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 Async closures (`async |file| { ... }`) can borrow `OplockFile` across awaits
-without making the handle cloneable or exposing it to detached tasks.
+without making `OplockFile` itself cloneable.
 
 ## The 0.2 design
 
@@ -104,9 +104,11 @@ without making the handle cloneable or exposing it to detached tasks.
 
 3. **A capability-safe protected handle.** Work receives a borrowed,
    non-cloneable `OplockFile`. It exposes metadata, flush, and positional
-   `read_at`/`write_at` operations but no raw Windows handle. Data operations
-   own their `Vec<u8>` and return it on completion, so caller memory cannot be
-   invalidated by async cancellation. Writes require an RW or RWH request.
+   `read_at`/`write_at` operations. An explicit unsafe `try_clone_handle` escape
+   hatch returns an independently owned Windows handle for inheritance or
+   cross-process duplication. Data operations own their `Vec<u8>` and return
+   it on completion, so caller memory cannot be invalidated by async
+   cancellation. Writes require an RW or RWH request.
 
 4. **Defined break and cancellation behavior.** Work is raced against the
    oplock request. If work finishes first, the request is specifically
@@ -158,9 +160,30 @@ drop(buffer);
 ```
 
 The work future must still be cancellation-safe: do not rely on statements
-after an `.await` always executing. The API prevents the protected handle and
-borrowed buffers from escaping, but it cannot make unrelated external side
-effects transactional.
+after an `.await` always executing. Borrowed buffers cannot escape, but the API
+cannot make unrelated external side effects transactional.
+
+## Duplicating the protected handle
+
+`OplockFile::try_clone_handle` returns an `OwnedHandle` in the current process:
+
+```rust
+// SAFETY: the recipient only retains and closes the duplicate. It does not
+// issue I/O through the IOCP-associated handle.
+let duplicate = unsafe { file.try_clone_handle()? };
+```
+
+The caller owns the duplicate and may arrange for a child process to inherit it
+or use the Windows `DuplicateHandle` API to copy it into another process. The
+oplock runtime does not track or close duplicates. Because they refer to the
+same underlying file object, duplicates can keep that object and its IOCP
+association alive after the callback or break guard is gone. The caller must
+close every duplicate, including copies in other processes.
+
+The method is unsafe because IOCP association is shared by duplicated file
+handles. The caller must ensure that no operation through a duplicate can queue
+a completion packet not created by this crate. Transferring, retaining, and
+closing the duplicate without issuing I/O through it satisfies this contract.
 
 ## Break information
 

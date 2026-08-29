@@ -5,7 +5,7 @@ use std::{
     mem::{size_of, zeroed},
     os::windows::{
         fs::OpenOptionsExt,
-        io::{AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle},
+        io::{AsHandle, AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle},
     },
     path::Path,
     ptr::null_mut,
@@ -508,6 +508,12 @@ pub(super) struct RawOplockFile {
 }
 
 impl RawOplockFile {
+    pub(super) fn try_clone_handle(&self) -> io::Result<OwnedHandle> {
+        let _operation = BlockingOperation::start(Arc::clone(&self.state))?;
+        self.state
+            .with_file(|file| file.as_handle().try_clone_to_owned())
+    }
+
     pub(super) async fn metadata(&self) -> io::Result<Metadata> {
         let operation = BlockingOperation::start(Arc::clone(&self.state))?;
         tokio::task::spawn_blocking(move || operation.state.with_file(File::metadata))

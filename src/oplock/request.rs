@@ -4,6 +4,7 @@ use std::{
     fs::Metadata,
     io,
     ops::AsyncFnOnce,
+    os::windows::io::OwnedHandle,
     path::{Path, PathBuf},
 };
 
@@ -346,8 +347,10 @@ pub type BufferResult = (Result<usize, OplockError>, Vec<u8>);
 
 /// The sole capability for operating on a protected handle.
 ///
-/// The type deliberately exposes no raw handle and is not cloneable. Data I/O
-/// uses owned buffers so cancellation cannot outlive caller-provided memory.
+/// The type is not cloneable. Data I/O uses owned buffers so cancellation
+/// cannot outlive caller-provided memory. Use
+/// [`try_clone_handle`](Self::try_clone_handle) when another component needs an
+/// independently owned Windows handle and can uphold its safety contract.
 pub struct OplockFile {
     inner: RawOplockFile,
 }
@@ -359,6 +362,34 @@ impl fmt::Debug for OplockFile {
 }
 
 impl OplockFile {
+    /// Duplicates the protected handle into the current process.
+    ///
+    /// The returned handle has the same access rights as the protected handle
+    /// and is owned by the caller. It is not tracked or closed by the oplock
+    /// runtime. It can be inherited by a child process or duplicated into
+    /// another process with the Windows `DuplicateHandle` API.
+    ///
+    /// A duplicate refers to the same underlying file object. Keeping it open,
+    /// including in another process, extends the lifetime of that object and
+    /// its completion-port association beyond this callback and any
+    /// [`OplockBreakGuard`].
+    ///
+    /// # Safety
+    ///
+    /// The protected handle is associated with this runtime's I/O completion
+    /// port, and that association is shared by duplicates. The caller must
+    /// ensure that operations through a duplicate cannot enqueue completion
+    /// packets that were not created by this crate. It is sound to transfer,
+    /// retain, and close the duplicate without issuing I/O through it.
+    pub unsafe fn try_clone_handle(&self) -> Result<OwnedHandle, OplockError> {
+        self.inner
+            .try_clone_handle()
+            .map_err(|source| OplockError::Operation {
+                kind: OperationKind::Handle,
+                source,
+            })
+    }
+
     /// Reads metadata from the protected handle.
     pub async fn metadata(&self) -> Result<Metadata, OplockError> {
         self.inner
